@@ -3,3 +3,17 @@ __pycache__/
 *.pyc
 drug_faiss_index
 prescription_env
+
+# Local environments, generated indexes and prescription artifacts
+.venv/
+venv/
+drug_match_index.pkl
+drug_bm25_index.pkl
+*_result.json
+*_analysis.json
+uvicorn*.log
+.pytest_cache/
+.env.*
+!.env.example
+
+drug_results.json

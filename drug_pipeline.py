@@ -25,13 +25,11 @@ from collections import defaultdict
 import pandas as pd
 from rapidfuzz import fuzz, process
 from dotenv import load_dotenv
-from langchain_core.documents import Document
-from langchain_community.retrievers import BM25Retriever
 from openai import OpenAI
 
 load_dotenv()
 
-INDEX_PATH      = "./drug_bm25_index.pkl"
+INDEX_PATH      = "./drug_match_index.pkl"
 ARABIC_RE       = re.compile(r'[\u0600-\u06FF]')
 FUZZY_SCORE_MIN = 85
 BRAND_CUTOFF    = 82
@@ -50,7 +48,8 @@ def _make_client() -> OpenAI | None:
         return None
     return OpenAI(
         api_key=key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=45, max_retries=0
     )
 
 _CLIENT: OpenAI | None = _make_client()
@@ -66,7 +65,7 @@ def build_index(xlsx_path: str, force: bool = False):
     global _INDEX_CACHE
     if Path(INDEX_PATH).exists() and not force:
         return
-    print(f"[Index] Building from '{xlsx_path}'...")
+    pass  # Do not log prescription content.
     df = pd.read_excel(xlsx_path)
     df["DRUGNAME"] = df["DRUGNAME"].astype(str).str.strip()
     df = df[df["DRUGNAME"] != ""].drop_duplicates()
@@ -76,17 +75,14 @@ def build_index(xlsx_path: str, force: bool = False):
         first = name.split()[0].upper()
         brand_map[first].append(name)
 
-    docs      = [Document(page_content=n) for n in df["DRUGNAME"]]
-    retriever = BM25Retriever.from_documents(docs)
 
     with open(INDEX_PATH, "wb") as f:
         pickle.dump({
-            "retriever": retriever,
             "names":     df["DRUGNAME"].tolist(),
             "brand_map": dict(brand_map),
         }, f)
     _INDEX_CACHE = None
-    print(f"[Index] {len(docs):,} items, {len(brand_map):,} unique brands → '{INDEX_PATH}'")
+    pass  # Do not log prescription content.
 
 
 def _load() -> dict:
@@ -102,7 +98,7 @@ def _load() -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_records(brand_map: dict, key: str, k: int) -> list[str]:
-    return brand_map.get(key.upper(), [])[:k]
+    return brand_map.get(key.upper(), [])
 
 
 def _length_ok(query: str, brand: str) -> bool:
@@ -126,7 +122,7 @@ def _fuzzy_brands(brand_map: dict, query: str, k: int, cutoff: int) -> list[tupl
             if record not in seen:
                 seen.add(record)
                 results.append((record, score))
-    return results[:k]
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -194,7 +190,9 @@ def _gemini_lookup(item_name: str) -> dict:
     }
     if _CLIENT is None:
         return empty
-    model = os.getenv("MODEL", "gemini-2.0-flash")
+    model = os.getenv("MODEL", "gemini-3.1-flash-lite")
+    from gemini_runtime import reserve_call
+    reserve_call()
     try:
         response = _CLIENT.chat.completions.create(
             model=model,
@@ -216,7 +214,7 @@ def _gemini_lookup(item_name: str) -> dict:
             "confidence":        str(data.get("confidence",        "low")).strip().lower(),
         }
     except Exception as e:
-        print(f"  [Gemini] Error: {e}")
+        pass  # Do not log prescription content.
         return empty
 
 
@@ -228,8 +226,8 @@ def _closest_dose_score(nums_in_name: list[str], dose_num: str) -> int:
     """Score a product by how close its strength is to the prescribed dose."""
     if not dose_num or not nums_in_name:
         return 0
-    target = int(dose_num)
-    valid  = [int(n) for n in nums_in_name if n.isdigit() and 0 < int(n) < 10000]
+    target = float(dose_num)
+    valid = [float(n) for n in nums_in_name if 0 < float(n) < 10000]
     if not valid:
         return 0
     diff = min(abs(n - target) for n in valid)
@@ -250,7 +248,8 @@ def _rerank(matches: list[str], route: str | None, dose: str | None) -> list[str
     """
     if not matches:
         return matches
-    dose_num = re.sub(r'[^\d]', '', str(dose)) if dose else ""
+    dose_match = re.search(r'\d+(?:\.\d+)?', str(dose)) if dose else None
+    dose_num = dose_match.group() if dose_match else ''
 
     def _score(name: str) -> int:
         upper = name.upper()
@@ -258,7 +257,10 @@ def _rerank(matches: list[str], route: str | None, dose: str | None) -> list[str
         if route and route.lower() in ("oral", "po", "by mouth"):
             if set(upper.split()) & _IV_KW:
                 s -= 30
-        s += _closest_dose_score(re.findall(r'\d+', upper), dose_num)
+        strengths = re.findall(r'(\d+(?:\.\d+)?)\s*(?:MG|MCG|ML|G|IU)\b', upper)
+        if not strengths:
+            strengths = re.findall(r'\d+(?:\.\d+)?', upper)[:1]
+        s += _closest_dose_score(strengths, dose_num)
         return s
 
     return sorted(matches, key=_score, reverse=True)
@@ -294,7 +296,8 @@ def match(
     """
     data      = _load()
     brand_map = data["brand_map"]
-    query_up  = item_name.strip().upper()
+    dose = dose or (re.search(r'\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|iu)\b', item_name, re.I).group() if re.search(r'\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|iu)\b', item_name, re.I) else None)
+    query_up = re.split(r'\s*\d', item_name.strip(), maxsplit=1)[0].strip().upper()
     is_arabic = bool(ARABIC_RE.search(item_name))
 
     # ── Level 1: Exact key in DB ──────────────────────────────────────────
@@ -305,7 +308,7 @@ def match(
                 "input_type": "exact",
                 "active":     None,
                 "category":   None,
-                "matches":    _rerank(records, route, dose),
+                "matches":    _rerank(records, route, dose)[:k],
                 "confidence": "EXACT",
                 "note":       None,
             }
@@ -318,20 +321,20 @@ def match(
                 "input_type": "fuzzy",
                 "active":     None,
                 "category":   None,
-                "matches":    _rerank([n for n, _ in hits], route, dose),
+                "matches":    _rerank([n for n, _ in hits], route, dose)[:k],
                 "confidence": "HIGH",
                 "note":       None,
             }
 
     # ── Level 3: Gemini — classify + resolve ─────────────────────────────
-    print(f"  [Gemini] '{item_name}' → identifying...")
+    pass  # Do not log prescription content.
     g        = _gemini_lookup(item_name)
     active   = g["active_ingredient"]
     category = g["category"]
     brands   = g["brands"]
     gconf    = g["confidence"]
     itype    = g["input_type"]
-    print(f"  [Gemini] Type={itype} | Active='{active}' | Brands={brands} | Conf={gconf}")
+    pass  # Do not log prescription content.
 
     # Completely unidentifiable
     if not brands and not active:
@@ -376,8 +379,8 @@ def match(
             "note":       note,
         }
 
-    pre_ranked = [n for n, _ in sorted(seen.items(), key=lambda x: -x[1])[:k]]
-    ranked     = _rerank(pre_ranked, route, dose)
+    pre_ranked = [n for n, _ in sorted(seen.items(), key=lambda x: -x[1])]
+    ranked     = _rerank(pre_ranked, route, dose)[:k]
     conf       = "MEDIUM" if gconf == "high" else "LOW"
 
     return {
@@ -414,107 +417,6 @@ def match_many(
 # DISPLAY
 # ══════════════════════════════════════════════════════════════════════════
 
-_CATEGORY_BADGE = {
-    "rx":         "💊 Rx",
-    "otc":        "🏪 OTC",
-    "supplement": "🌿 Supp",
-    "other":      "📦 Other",
-}
-
-# Human-readable label per input_type
-_ITYPE_LABEL = {
-    "exact":        "✓✓ Exact match",
-    "fuzzy":        "✓  Fuzzy match",
-    "brand":        "~  Brand (Gemini)",
-    "active":       "⚗️  Active ingredient",
-    "misspelling":  "~  Misspelling resolved",
-    "abbreviation": "~  Abbreviation resolved",
-    "arabic":       "~  Arabic resolved",
-    "supplement":   "~  Supplement",
-    "unknown":      "⚠  Uncertain",
-}
-
-_CONF_COLOR = {
-    "EXACT":     "🟢",
-    "HIGH":      "🟢",
-    "MEDIUM":    "🟡",
-    "LOW":       "🟠",
-    "NOT_FOUND": "🔴",
-}
-
-
-def print_results(
-    results:           dict[str, dict],
-    prescription_meta: dict[str, dict] | None = None,
-):
-    """
-    Print enriched matching results.
-    prescription_meta: {drug_name: {dose, frequency, duration, route, notes}}
-    """
-    W    = 72
-    meta = prescription_meta or {}
-
-    found    = sum(1 for v in results.values() if v["confidence"] != "NOT_FOUND")
-    notfound = len(results) - found
-
-    print()
-    print("┌" + "─" * (W - 2) + "┐")
-    print("│" + "  📋  PRESCRIPTION MATCHING RESULTS".center(W - 2) + "│")
-    print("├" + "─" * (W - 2) + "┤")
-
-    for idx, (query, result) in enumerate(results.items(), 1):
-        conf      = result["confidence"]
-        color     = _CONF_COLOR[conf]
-        matches   = result["matches"]
-        category  = result.get("category")
-        active    = result.get("active")
-        note      = result.get("note")
-        itype     = result.get("input_type", "")
-        badge     = _CATEGORY_BADGE.get(category, "") if category else ""
-        drug_meta = meta.get(query, {})
-        label     = _ITYPE_LABEL.get(itype, "~  Gemini")
-
-        print("│" + " " * (W - 2) + "│")
-
-        # ── Drug name + badge ─────────────────────────────────────────────
-        header  = f"  {color} {idx}. {query.upper()}"
-        padding = W - 2 - len(header) - len(badge)
-        print("│" + header + " " * max(padding, 1) + badge + "│")
-
-        # ── Rx info line ──────────────────────────────────────────────────
-        rx_parts = []
-        if drug_meta.get("dose"):      rx_parts.append(f"Dose: {drug_meta['dose']}")
-        if drug_meta.get("frequency"): rx_parts.append(f"Freq: {drug_meta['frequency']}")
-        if drug_meta.get("duration"):  rx_parts.append(f"Dur:  {drug_meta['duration']}")
-        if drug_meta.get("route"):     rx_parts.append(f"Route: {drug_meta['route']}")
-        if rx_parts:
-            print("│" + ("     " + "  │  ".join(rx_parts)).ljust(W - 2) + "│")
-        if drug_meta.get("notes"):
-            print("│" + f"     📝 {drug_meta['notes']}".ljust(W - 2) + "│")
-
-        # ── Match type + resolved active ingredient ───────────────────────
-        sub = f"     {label}"
-        if active and itype not in ("exact", "fuzzy"):
-            sub += f"  →  {active}"
-        print("│" + sub.ljust(W - 2) + "│")
-
-        # ── Divider ───────────────────────────────────────────────────────
-        print("│" + "     " + "·" * (W - 7) + "│")
-
-        # ── DB matches ────────────────────────────────────────────────────
-        if conf == "NOT_FOUND":
-            print("│" + f"     ✗  {note or 'Not found in database'}".ljust(W - 2) + "│")
-        else:
-            for i, m in enumerate(matches, 1):
-                prefix = "  ★ " if i == 1 else f"  {i}."
-                print("│" + f"     {prefix} {m}".ljust(W - 2) + "│")
-
-    # ── Footer ────────────────────────────────────────────────────────────
-    print("├" + "─" * (W - 2) + "┤")
-    print("│" + f"  Total: {len(results)}   🟢 Found: {found}   🔴 Not Found: {notfound}".ljust(W - 2) + "│")
-    print("│" + "  ✓✓ Exact  ✓ Fuzzy  ⚗️ Active  ~ Gemini  ⚠ Uncertain  ✗ Not found".ljust(W - 2) + "│")
-    print("├" + "─" * (W - 2) + "┤")
-    print("│" + "  ⚠️  DISCLAIMER: AI-assisted analysis — for research purposes only.".ljust(W - 2) + "│")
-    print("│" + "     Always verify with a licensed pharmacist before dispensing.".ljust(W - 2) + "│")
-    print("└" + "─" * (W - 2) + "┘")
-    print()
+def print_results(*args, **kwargs):
+    """Prescription content is intentionally excluded from application logs."""
+    return None

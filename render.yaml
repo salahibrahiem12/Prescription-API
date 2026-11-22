@@ -1,0 +1,19 @@
+﻿services:
+  - type: web
+    name: prescription-studio
+    repo: https://github.com/salahibrahiem12/Prescription-API
+    branch: codex/prescription-website
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-web.txt && python -m unittest discover -s tests -v
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.12
+      - key: MODEL
+        value: gemini-3.1-flash-lite
+      - key: GEMINI_CALLS_PER_MINUTE
+        value: "10"
+      - key: WEB_CONCURRENCY
+        value: "1"
